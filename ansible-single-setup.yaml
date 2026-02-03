@@ -1,0 +1,146 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Script to have 1 ansible master and 2 server instances along with the VPC, Subnets, SecurityGroups, etc. 
+
+
+Parameters:
+  MarketplaceAmiId:
+    Type: AWS::EC2::Image::Id
+    Default: ami-0532be01f26a3de55
+    Description: AMI ID of AmazonLinuxImage
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: ansible-key
+    Description: EC2 KeyPair name for SSH access
+    
+Resources:
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: surajVPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: MyIGW
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: PublicRouteTable
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs 'us-east-1']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: prod-subnet
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH, HTTP, and HTTPS
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: InstanceSecurityGroup
+
+          
+  # --------------------
+  # Ansible Instance Creation
+  # --------------------          
+  EC2Instance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref MarketplaceAmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      NetworkInterfaces:
+      - DeviceIndex: 0
+        SubnetId: !Ref PublicSubnet1
+        AssociatePublicIpAddress: true
+        GroupSet:
+          - !Ref InstanceSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Set preserve hostname
+          sudo cp /etc/cloud/cloud.cfg /etc/cloud/cloud.cfg.bak
+          sudo sed -i 's/^preserve_hostname:.*/preserve_hostname: true/' /etc/cloud/cloud.cfg
+          grep -q "^preserve_hostname:" /etc/cloud/cloud.cfg || echo "preserve_hostname: true" | sudo tee -a /etc/cloud/cloud.cfg
+          sudo hostnamectl set-hostname ansible-server
+          
+          sudo yum update -y
+          sudo yum install -y python3-pip
+          sudo pip3 install ansible
+          sudo useradd devops
+          echo "devops:DevOps@123" | sudo chpasswd
+          sudo usermod -aG wheel devops
+          echo "devops ALL=(ALL:ALL) NOPASSWD:ALL" | sudo tee -a /etc/sudoers
+
+          # SSH hardening
+          sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
+          sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl restart sshd
+          sudo mkdir /etc/ansible 
+          sudo -u devops ansible-config init --disabled > /etc/ansible/ansible.cfg
+          sudo echo "" > /etc/ansible/hosts
+          sudo echo "[local]" >> /etc/ansible/hosts
+          sudo echo "localhost ansible_connection=local" >> /etc/ansible/hosts
+      Tags:
+        - Key: Name
+          Value: ansible-server
